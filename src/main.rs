@@ -1,10 +1,12 @@
-use std::{f32::consts::{E, PI}, fs::File, io::{BufReader, Read, ErrorKind, Write, self}, time::Instant};
-use num_complex::{Complex, ComplexFloat};
+use std::{f32::consts::{E, PI}, fs::File,
+   io::{BufReader, Read, ErrorKind, Write, self, BufWriter}, time::Instant, env};
+use num_complex::Complex;
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
     let mut processor = FmProcessor::new(
-        "/home/trzcinkde/Documents/Programming/rust/fm-audio-proccess/data/fm1_99M726_1M92.cu8",
-        "/home/trzcinkde/Documents/Programming/rust/fm-audio-proccess/data/out.au"
+        args.get(1).expect("Please provide input and output paths as arguments").to_owned(),
+        args.get(2).expect("Please provide input and output paths as arguments").to_owned()
     );
 
     processor.add_node(Box::new(FmShifter(-0.0906250)));
@@ -15,91 +17,56 @@ fn main() {
     processor.start();
 }
 
-enum FmData {
-    ComplexData(Vec<Complex<f32>>),
-    RealData(Vec<f32>)
-}
-
 trait ProcessingNode {
-    fn process(&self, data: FmData) -> FmData;
+    fn process(&self, data: Vec<Complex<f32>>) -> Vec<Complex<f32>>;
 }
 
 struct Decimator(usize);
 impl ProcessingNode for Decimator {
-    fn process(&self, data: FmData) -> FmData {
-        match data {
-            FmData::ComplexData(data) => {
-                FmData::ComplexData(
-                    data.chunks(self.0)
-                        .map(|chunk| 
-                            chunk.into_iter().sum::<Complex<f32>>() / Complex::new(chunk.len() as f32, 0.0)
-                        ).collect()
-                )
-            },
-            FmData::RealData(data) => {
-                FmData::RealData(
-                    data.chunks(self.0)
-                        .map(|chunk| 
-                            chunk.into_iter().sum::<f32>() / chunk.len() as f32
-                        ).collect()
-                )
-            }
-        }
+    fn process(&self, data: Vec<Complex<f32>>) -> Vec<Complex<f32>> {
+        data.chunks(self.0)
+            .map(|chunk|
+                chunk.into_iter().sum::<Complex<f32>>() / Complex::new(chunk.len() as f32, 0.0)
+            ).collect()
     }
 }
 
 struct FmShifter(f32);
 impl ProcessingNode for FmShifter {
-    fn process(&self, data: FmData) -> FmData {
-        match data {
-            FmData::RealData(_) => panic!("FmShifter expected complex data, received real data"),
-            FmData::ComplexData(data) => {
-                FmData::ComplexData(
-                    data.into_iter().enumerate().map(|(n, val)|
-                        val * Complex::new(E,0.0).powc(Complex::new(0.0, 2.0 * PI * self.0 * n as f32))
-                    ).collect()
-                )
-            }
-        }
+    fn process(&self, data: Vec<Complex<f32>>) -> Vec<Complex<f32>> {
+        data.into_iter().enumerate().map(|(n, val)|
+            val * Complex::new(E,0.0).powc(Complex::new(0.0, 2.0 * PI * self.0 * n as f32))
+        ).collect()
     }
 }
 
 struct FmDemodulator;
 impl ProcessingNode for FmDemodulator {
-    fn process(&self, data: FmData) -> FmData {
-        match data {
-            FmData::RealData(_) => panic!("FmDemodulator expected complex data, received real data"),
-            FmData::ComplexData(data) => {
-                FmData::RealData(
-                    data.windows(2).map(|chunk| {
-                        (chunk[1] * chunk[0].conj()).arg() / PI
-                    }).collect()
-                )
-            }
-        }
+    fn process(&self, data: Vec<Complex<f32>>) -> Vec<Complex<f32>> {
+        data.windows(2).map(|chunk| {
+            Complex::new((chunk[1] * chunk[0].conj()).arg() / PI, 0.0)
+        }).collect()
     }
 }
 
 const BUFFER_SIZE: usize = 640000;
 struct FmProcessor {
-    input_path: &'static str,
-    output_path: &'static str,
-    data: FmData,
+    input_path: String,
+    output_path: String,
+    data: Vec<Complex<f32>>,
     nodes: Vec<Box<dyn ProcessingNode>>
 }
 impl FmProcessor {
-    fn new(input: &'static str, output: &'static str) -> FmProcessor {
-        FmProcessor { input_path: input, output_path: output, 
-            data: FmData::ComplexData(vec![]), nodes: vec![] }
+    fn new(input: String, output: String) -> FmProcessor {
+        FmProcessor { input_path: input, output_path: output,
+            data: vec![], nodes: vec![] }
     }
 
-    fn prepare_output(mut output: File) -> Result<File, io::Error> {
-        output.write(&(0x2e736e64 as u32).to_le_bytes())?;
-        output.write(&(24 as u32).to_le_bytes())?;
-        output.write(&(0xffffffff as u32).to_le_bytes())?;
-        output.write(&(6 as u32).to_le_bytes())?;
-        output.write(&(48000 as u32).to_le_bytes())?;
-        output.write(&(1 as u32).to_le_bytes())?;
+    fn prepare_output(mut output: BufWriter<File>) -> Result<BufWriter<File>, io::Error> {
+        let header_params: [u32; 6] = [0x2e736e64, 24, 0xffffffff, 6, 48000, 1];
+        for param in header_params {
+            output.write(&param.to_be_bytes())?;
+        }
         Ok(output)
     }
 
@@ -108,13 +75,14 @@ impl FmProcessor {
     }
 
     fn start(mut self) {
-        let input_file = File::open(self.input_path).expect("cannot open input");       
+        let input_file = File::open(self.input_path).expect("cannot open input");
         let mut reader = BufReader::new(input_file);
         let output_file = File::options()
             .create(true)
             .append(true)
             .open(self.output_path).expect("cannot prepare output file");
-        let mut output_file = FmProcessor::prepare_output(output_file).expect("cannot write header");
+        let writer = BufWriter::new(output_file);
+        let mut writer = FmProcessor::prepare_output(writer).expect("cannot write header");
         let mut buffer = [0; BUFFER_SIZE];
         let t1 = Instant::now();
         let mut bytes_read = 0;
@@ -124,27 +92,22 @@ impl FmProcessor {
                 Err(e) => panic!("{:?}", e),
                 Ok(0) => break,
                 Ok(n) => {
-                    self.data = FmData::ComplexData(
-                        buffer.chunks(2).map(|pair| 
+                    self.data = buffer
+                        .chunks(2).map(|pair|
                             Complex::new(
-                                (pair[0] as f32 - 127.5) / 127.5, 
+                                (pair[0] as f32 - 127.5) / 127.5,
                                 (pair[1] as f32 - 127.5) / 127.5
                             )
-                        ).collect()
-                    );
+                        ).collect();
 
                     for node in &self.nodes {
                         self.data = node.process(self.data);
                     }
 
-                    match self.data {
-                        FmData::ComplexData(_) => panic!("Trying to save complex data"),
-                        FmData::RealData(data) => {
-                            for val in data {
-                                output_file.write(&val.to_le_bytes()).expect("cannot write to output");
-                            }
-                        }
+                    for val in self.data {
+                        writer.write(&val.re.to_be_bytes()).expect("cannot write to output");
                     }
+
                     bytes_read += n;
                 }
             }
